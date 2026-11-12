@@ -13,6 +13,9 @@ import functools
 import json
 from typing import Any, List, Sequence, Tuple
 
+from tokenizers import Tokenizer
+from transformers import PreTrainedTokenizerBase
+
 from sglang.srt.entrypoints.systemone.protocol import (
     SystemOneChoiceQuestion,
     SystemOneNoulQuestion,
@@ -23,6 +26,22 @@ from sglang.srt.layers.joint_schema_head import (
     QUESTION_TYPES,
     LayoutQuestion,
     pack_decision_layout,
+)
+
+try:  # transformers v5
+    from transformers.tokenization_utils_tokenizers import (
+        TokenizersBackend as _TokenizersBackend,
+    )
+except ImportError:
+    _TokenizersBackend = None
+_OVERRIDES = frozenset(
+    (
+        "encode",
+        "_get_padding_truncation_strategies",
+        "_encode_plus",
+        "set_truncation_and_padding",
+        "_convert_encoding",
+    )
 )
 
 _SYSTEM_PROMPT = (
@@ -53,6 +72,44 @@ def _render(value: Any) -> str:
     if isinstance(value, str):
         return value
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+
+
+def _state_ids(tokenizer: Any, text: str) -> List[int]:
+    """``tokenizer.encode(text, add_special_tokens=False)``, by one call to the
+    Rust backend when that call gives the same ids.
+
+    The stock HF v5 fast encode (no padding, no truncation) clears the
+    backend's truncation and padding, sets its ``encode_special_tokens`` to
+    ``split_special_tokens`` and returns
+    ``backend.encode_batch([text], add_special_tokens=False)[0].ids``. With the
+    backend already in that state and ``split_special_tokens`` off,
+    ``encode_batch_fast`` runs the same pipeline without computing character
+    offsets, which the ids do not use. Any other tokenizer or backend state
+    takes the original encode.
+    """
+    backend = getattr(tokenizer, "_tokenizer", None)
+    cls = type(tokenizer)
+    if (
+        _TokenizersBackend is not None
+        and type(backend) is Tokenizer
+        and getattr(tokenizer, "is_fast", False)
+        # Only the stock path: encode -> _encode_plus -> backend.encode_batch.
+        and cls.encode is PreTrainedTokenizerBase.encode
+        and cls._get_padding_truncation_strategies
+        is PreTrainedTokenizerBase._get_padding_truncation_strategies
+        and cls._encode_plus is _TokenizersBackend._encode_plus
+        and cls.set_truncation_and_padding
+        is _TokenizersBackend.set_truncation_and_padding
+        and cls._convert_encoding is _TokenizersBackend._convert_encoding
+        and not _OVERRIDES.intersection(vars(tokenizer))
+        and not getattr(tokenizer, "split_special_tokens", False)
+        # The state that encode would set before calling the backend.
+        and backend.truncation is None
+        and backend.padding is None
+        and not backend.encode_special_tokens
+    ):
+        return backend.encode_batch_fast([text], add_special_tokens=False)[0].ids
+    return tokenizer.encode(text, add_special_tokens=False)
 
 
 @functools.lru_cache(maxsize=4096)
@@ -144,7 +201,7 @@ def encode_joint_schema(
             f"the questions need {fixed_length} prompt tokens before the state, "
             f"but the prompt holds at most {max_length}"
         )
-    state = tokenizer.encode(_render(request.state), add_special_tokens=False)
+    state = _state_ids(tokenizer, _render(request.state))
     budget = max_length - fixed_length
     if layout == "sandwich" and len(state) > budget:
         # A guard must read the newest message, at the end of the state:
