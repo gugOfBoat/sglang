@@ -9,6 +9,7 @@ each piece is tokenized on its own.
 
 from __future__ import annotations
 
+import functools
 import json
 from typing import Any, List, Sequence, Tuple
 
@@ -54,6 +55,14 @@ def _render(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
 
 
+@functools.lru_cache(maxsize=4096)
+def _piece_ids(tokenizer: Any, text: str) -> Tuple[int, ...]:
+    """The ids of a prompt piece other than the state. Requests with the same
+    questions repeat these pieces, and tokenizing each one again costs ~2 ms
+    a request, more than the state."""
+    return tuple(tokenizer.encode(text, add_special_tokens=False))
+
+
 def joint_schema_options(question: SystemOneQuestion) -> List[Tuple[str, Any]]:
     """Each option's name and description, in the order the head scores them."""
     if isinstance(question, SystemOneNoulQuestion):
@@ -82,7 +91,7 @@ def encode_joint_schema(
     """
 
     def tokens(text: str) -> List[int]:
-        return tokenizer.encode(text, add_special_tokens=False)
+        return list(_piece_ids(tokenizer, text))
 
     if layout not in LAYOUTS:
         raise ValueError(f"unknown joint schema layout {layout!r}")
@@ -135,7 +144,7 @@ def encode_joint_schema(
             f"the questions need {fixed_length} prompt tokens before the state, "
             f"but the prompt holds at most {max_length}"
         )
-    state = tokens(_render(request.state))
+    state = tokenizer.encode(_render(request.state), add_special_tokens=False)
     budget = max_length - fixed_length
     if layout == "sandwich" and len(state) > budget:
         # A guard must read the newest message, at the end of the state:
