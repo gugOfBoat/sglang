@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import itertools
 import logging
 from typing import TYPE_CHECKING, Optional, Union
 
@@ -304,14 +305,32 @@ class MambaAttnBackendBase(AttentionBackend):
                     if retrieve_next_token is not None:
                         retrieve_parent_token = torch.empty_like(retrieve_next_token)
             else:
-                query_start_loc = torch.empty(
-                    (bs + 1,), dtype=torch.int32, device=self.device
-                )
-                query_start_loc[:bs] = forward_batch.extend_start_loc
-                query_start_loc[bs] = (
-                    forward_batch.extend_start_loc[-1]
-                    + forward_batch.extend_seq_lens[-1]
-                )
+                extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
+                if (
+                    extend_seq_lens_cpu is not None
+                    and len(extend_seq_lens_cpu) == bs
+                    and forward_batch.tbo_parent_token_range is None
+                    and forward_batch.spec_info is None
+                    and forward_batch.extend_start_loc.shape[0] == bs
+                    and forward_batch.extend_prefix_lens_cpu is not None
+                    and not any(forward_batch.extend_prefix_lens_cpu)
+                ):
+                    # extend_start_loc is the exclusive cumsum of the extend lens,
+                    # so this is the same [0, cumsum] built on the host: one H2D
+                    # copy instead of four small device ops.
+                    query_start_loc = self._track_indices_to_device(
+                        [0, *itertools.accumulate(extend_seq_lens_cpu)],
+                        dtype=torch.int32,
+                    )
+                else:
+                    query_start_loc = torch.empty(
+                        (bs + 1,), dtype=torch.int32, device=self.device
+                    )
+                    query_start_loc[:bs] = forward_batch.extend_start_loc
+                    query_start_loc[bs] = (
+                        forward_batch.extend_start_loc[-1]
+                        + forward_batch.extend_seq_lens[-1]
+                    )
                 if (
                     forward_batch.extend_seq_lens_cpu is not None
                     and len(forward_batch.extend_seq_lens_cpu) == bs

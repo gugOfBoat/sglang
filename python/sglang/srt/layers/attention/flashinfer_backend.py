@@ -58,6 +58,7 @@ from sglang.srt.utils import (
     get_cuda_graph_max_batch_size,
     get_int_env_var,
     is_flashinfer_available,
+    is_pin_memory_available,
     next_power_of_2,
 )
 
@@ -2240,6 +2241,29 @@ class FlashInferIndicesUpdaterPrefill:
             and not (multi_item_params is not None and multi_item_params.is_enabled())
         )
         if ragged_only:
+            if (
+                isinstance(seq_lens_cpu, torch.Tensor)
+                and seq_lens_cpu.device.type == "cpu"
+                and seq_lens_cpu.shape[0] == bs
+            ):
+                # No cached prefix, so the extend lens are seq_lens: build the
+                # indptr on the host. plan() then skips its two D2H syncs and
+                # mirrors this tensor to the device itself.
+                qo_indptr_host = torch.zeros(
+                    (bs + 1,),
+                    dtype=torch.int32,
+                    pin_memory=is_pin_memory_available(seq_lens.device),
+                )
+                qo_indptr_host[1:] = torch.cumsum(seq_lens_cpu, dim=0)
+                wrapper_ragged.begin_forward(
+                    qo_indptr_host,
+                    qo_indptr_host,
+                    self.num_qo_heads,
+                    self.num_kv_heads,
+                    self.head_dim,
+                    q_data_type=self.q_data_type,
+                )
+                return
             qo_indptr[1 : bs + 1] = torch.cumsum(seq_lens - prefix_lens, dim=0)
             wrapper_ragged.begin_forward(
                 qo_indptr[: bs + 1],
