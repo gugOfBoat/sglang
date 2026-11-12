@@ -2228,6 +2228,28 @@ class FlashInferIndicesUpdaterPrefill:
         translator = self.attn_backend.kv_index_translator
         use_swa_source = use_sliding_window_kv_pool and translator.reads_are_translated
         read_kind = IdSpaceKind.SLIDING_WINDOW if use_swa_source else IdSpaceKind.FULL
+        # Ragged extend over no cached prefix: forward_extend then runs only the
+        # ragged wrapper (extend_no_prefix), so the paged ids and plan go unused.
+        ragged_only = (
+            spec_info is None
+            and use_ragged
+            and paged_kernel_lens_sum == 0
+            and custom_kv_indices is None
+            and cross_attention_custom_mask is None
+            and not use_sliding_window_kv_pool
+            and not (multi_item_params is not None and multi_item_params.is_enabled())
+        )
+        if ragged_only:
+            qo_indptr[1 : bs + 1] = torch.cumsum(seq_lens - prefix_lens, dim=0)
+            wrapper_ragged.begin_forward(
+                qo_indptr[: bs + 1],
+                qo_indptr[: bs + 1],
+                self.num_qo_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                q_data_type=self.q_data_type,
+            )
+            return
         if spec_info is None:
             assert prefix_lens is not None
             assert len(seq_lens) == len(req_pool_indices)
