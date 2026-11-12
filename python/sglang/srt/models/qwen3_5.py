@@ -2606,6 +2606,7 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
             # FP32 parameters, as GreenLeaf trains and saves its head.
             self.pooler.head.float()
         self.pooler.head.load_state_dict(state_dict, strict=True)
+        self.pooler.head.cache_bf16_weights()
 
     def _load_decision_readout(self) -> None:
         """Place the checkpoint's decision readout in the LM head rows of its codes."""

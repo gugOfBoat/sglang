@@ -303,6 +303,36 @@ class JointSchemaHead(nn.Module):
         self.memory_mix = nn.Parameter(torch.zeros(n_mix)) if n_mix else None
 
     @torch.no_grad()
+    def cache_bf16_weights(self) -> None:
+        """Cast the FP32 Linear and attention projection weights to BF16 once.
+
+        Under BF16 autocast every projection cast its FP32 weight and bias again
+        on each call (about 90 cast kernels a forward). The copies made here are
+        the same casts, done at load, so the GEMMs see the same bits."""
+        if not self.greenleaf:
+            return
+        cross = {id(l.attention) for l in self.evidence_layers}
+        cross |= {id(l.multihead_attn) for l in self.layers}
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                module.register_buffer("weight_bf16", module.weight.to(torch.bfloat16), persistent=False)
+                bias = None if module.bias is None else module.bias.to(torch.bfloat16)
+                module.register_buffer("bias_bf16", bias, persistent=False)
+                module.forward = _linear_bf16.__get__(module)
+            elif isinstance(module, nn.MultiheadAttention):
+                width = module.embed_dim
+                weight, bias = module.in_proj_weight, module.in_proj_bias
+                # The same pieces _attention projects with, each cast on its own.
+                parts = (
+                    zip(weight.split([width, 2 * width]), bias.split([width, 2 * width]))
+                    if id(module) in cross
+                    else [(weight, bias)]
+                )
+                module.in_proj_bf16 = [
+                    (w.to(torch.bfloat16), b.to(torch.bfloat16)) for w, b in parts
+                ]
+
+    @torch.no_grad()
     def forward_batch(
         self,
         hidden: torch.Tensor,
@@ -581,6 +611,11 @@ class JointSchemaHead(nn.Module):
         return list(torch.split(logits.float(), option_counts))
 
 
+def _linear_bf16(self: nn.Linear, x: torch.Tensor) -> torch.Tensor:
+    """nn.Linear.forward with the weight and bias cached by cache_bf16_weights."""
+    return F.linear(x, self.weight_bf16, self.bias_bf16)
+
+
 def _attention(
     module: nn.MultiheadAttention,
     queries: torch.Tensor,
@@ -599,13 +634,16 @@ def _attention(
     by softmax (α ≈ 1)."""
     width = queries.shape[-1]
     heads = module.num_heads
+    cached = getattr(module, "in_proj_bf16", None)
     if keys is None:
-        query, key, value = F.linear(
-            queries, module.in_proj_weight, module.in_proj_bias
-        ).chunk(3, dim=-1)
+        weight, bias = cached[0] if cached else (module.in_proj_weight, module.in_proj_bias)
+        query, key, value = F.linear(queries, weight, bias).chunk(3, dim=-1)
     else:
-        query_weight, key_value_weight = module.in_proj_weight.split([width, 2 * width])
-        query_bias, key_value_bias = module.in_proj_bias.split([width, 2 * width])
+        if cached:
+            (query_weight, query_bias), (key_value_weight, key_value_bias) = cached
+        else:
+            query_weight, key_value_weight = module.in_proj_weight.split([width, 2 * width])
+            query_bias, key_value_bias = module.in_proj_bias.split([width, 2 * width])
         query = F.linear(queries, query_weight, query_bias)
         key, value = F.linear(keys, key_value_weight, key_value_bias).chunk(2, dim=-1)
     head_dim = width // heads
