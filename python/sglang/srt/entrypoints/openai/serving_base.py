@@ -77,6 +77,11 @@ class OpenAIServingBase(ABC):
         # Fall back to explicit lora_path
         return explicit_lora_path
 
+    def _converts_on_loop(self) -> bool:
+        """Whether _convert_to_internal_request is cheap enough to run on the event
+        loop, which saves the two thread hops of the executor."""
+        return False
+
     async def handle_request(
         self, request: OpenAIServingRequest, raw_request: Request
     ) -> Union[Any, StreamingResponse, ErrorResponse]:
@@ -96,12 +101,17 @@ class OpenAIServingBase(ABC):
             if request_logger.log_requests and request_logger.log_requests_level >= 2:
                 request_logger.log_openai_received_request(request, request=raw_request)
 
-            # Convert off-loop: jinja render + full-prompt tokenization blocks
-            # the loop on long prompts, and the rust tokenizer releases the GIL.
-            loop = asyncio.get_running_loop()
-            adapted_request, processed_request = await loop.run_in_executor(
-                None, self._convert_to_internal_request, request, raw_request
-            )
+            if self._converts_on_loop():
+                adapted_request, processed_request = self._convert_to_internal_request(
+                    request, raw_request
+                )
+            else:
+                # Convert off-loop: jinja render + full-prompt tokenization blocks
+                # the loop on long prompts, and the rust tokenizer releases the GIL.
+                loop = asyncio.get_running_loop()
+                adapted_request, processed_request = await loop.run_in_executor(
+                    None, self._convert_to_internal_request, request, raw_request
+                )
 
             if isinstance(adapted_request, (GenerateReqInput, EmbeddingReqInput)):
                 # Only set timing fields if adapted_request supports them

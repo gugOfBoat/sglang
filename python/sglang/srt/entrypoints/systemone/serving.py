@@ -76,6 +76,10 @@ class SystemOneServing(OpenAIServingDecisions):
     def _request_id_prefix(self) -> str:
         return "systemone-"
 
+    def _converts_on_loop(self) -> bool:
+        # The joint schema request only checks legends here; it encodes later.
+        return self.joint_head_config is not None
+
     def _validate_request(self, request: SystemOneRequest) -> Optional[str]:
         if self.joint_head_config is not None or self.pointer_head is not None:
             return self._validate_joint_schema_request(request)
