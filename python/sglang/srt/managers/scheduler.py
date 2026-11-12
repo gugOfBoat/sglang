@@ -2632,7 +2632,13 @@ class Scheduler(
 
     def init_output_streamer(self) -> None:
         self.output_streamer = self.get_output_streamer_class()(
-            send_to_detokenizer=self.ipc_channels.send_to_detokenizer,
+            # An embedding model's outputs pass the detokenizer unchanged, so with
+            # one tokenizer worker they go straight to it: one process hop less.
+            send_to_detokenizer=(
+                self.ipc_channels.send_to_tokenizer
+                if not self.is_generation and get_serving().tokenizer_worker_num == 1
+                else self.ipc_channels.send_to_detokenizer
+            ),
             tree_cache=self.tree_cache,
             server_args=self.server_args,
             is_generation=self.is_generation,
