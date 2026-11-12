@@ -53,6 +53,7 @@ from sglang.srt.layers.layer_boundary import (
     declare_ffn,
 )
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
+from sglang.srt.layers import greenleaf_swiglu
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     LinearParallelGroup,
@@ -242,6 +243,11 @@ class Qwen2MoeMLP(nn.Module):
         self,
         x,
     ):
+        if greenleaf_swiglu.can_use(x, self.gate_up_proj):
+            x, _ = self.down_proj(
+                greenleaf_swiglu.gate_up_silu(x, self.gate_up_proj.weight)
+            )
+            return x
         gate_up, _ = self.gate_up_proj(x)
         if self._enable_silu_fp4_quant_fusion and not isinstance(gate_up, tuple):
             x, _ = self.down_proj(self._silu_fp4_quant_fused(gate_up))
