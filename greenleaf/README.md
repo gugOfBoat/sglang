@@ -14,6 +14,8 @@ có sẵn trong SGLang ở 4 điểm (FP32, memory mix, SSMax, entmax), cộng t
 | `scripts/` | `to_sglang_format.py` (release → thư mục SGLang), cổng ① `check_render.py`, ② `check_head.py`, ③ `gate_gpu.py` (cần `GREENLEAF_SRC` = code train) |
 | `smoke/` | 2 request mẫu + `smoke.sh` |
 
+Biến môi trường: `GREENLEAF_ENTMAX_SOFTMAX=1` thay entmax bằng softmax; `GREENLEAF_ENTMAX_IMPL=triton|eager` chọn cách chạy entmax: một kernel Triton (mặc định) hoặc từng kernel PyTorch như lúc train.
+
 ## Phát hành
 
 ```bash

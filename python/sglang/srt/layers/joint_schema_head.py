@@ -16,12 +16,16 @@ more than its memory projection.
 from __future__ import annotations
 
 import math
+import os
 from typing import Callable, List, Optional, Sequence, Tuple
 
 import msgspec
 import torch
 import torch.nn.functional as F
+import triton
+import triton.language as tl
 from torch import nn
+from triton.language.extra import libdevice
 
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput
 
@@ -36,6 +40,9 @@ _MAX_GROUP_SLOTS = 1 << 18
 # as in GreenLeaf's training head.
 SSMAX_REF_LEN = 1024
 ENTMAX_ITERS = 40
+# How entmax runs: "triton" (one kernel) or "eager" (its kernels launched
+# one by one).
+_ENTMAX_IMPL = os.environ.get("GREENLEAF_ENTMAX_IMPL", "triton")
 
 
 def entmax_bisect(x: torch.Tensor, alpha: torch.Tensor, n_iter: int = ENTMAX_ITERS) -> torch.Tensor:
@@ -61,6 +68,61 @@ def entmax_bisect(x: torch.Tensor, alpha: torch.Tensor, n_iter: int = ENTMAX_ITE
         f_m = p.sum(-1, keepdim=True) - 1
         tau_lo = torch.where(f_m * f_lo >= 0, tau_m, tau_lo)
     return p / p.sum(-1, keepdim=True)
+
+
+@triton.jit
+def _entmax_bisect_kernel(
+    x_ptr, alpha_ptr, out_ptr, rows_per_head, n, inv_n,
+    N_ITER: tl.constexpr, BLOCK: tl.constexpr,
+):
+    """entmax_bisect for one row of x, the same steps in fp32: every bisection
+    step re-reads the row and sums (z - τ)₊^(1/(α-1)) in BLOCK-wide chunks."""
+    row = tl.program_id(0)
+    am1 = tl.load(alpha_ptr + row // rows_per_head) - 1.0
+    inv = 1.0 / am1
+    base = x_ptr + row.to(tl.int64) * n
+    cols = tl.arange(0, BLOCK)
+    max_val = float("-inf")
+    for start in range(0, n, BLOCK):
+        x = tl.load(base + start + cols, mask=start + cols < n, other=float("-inf"))
+        max_val = tl.maximum(max_val, tl.max(x * am1, 0))
+    tau_lo = max_val - 1.0
+    dm = (max_val - libdevice.pow(inv_n, am1)) - tau_lo
+    f_lo = -1.0
+    for start in range(0, n, BLOCK):
+        x = tl.load(base + start + cols, mask=start + cols < n, other=float("-inf"))
+        f_lo += tl.sum(libdevice.pow(tl.maximum(x * am1 - tau_lo, 0.0), inv), 0)
+    tau_m = tau_lo
+    total = 0.0
+    for _ in range(N_ITER):
+        dm = dm * 0.5
+        tau_m = tau_lo + dm
+        total = 0.0
+        for start in range(0, n, BLOCK):
+            x = tl.load(base + start + cols, mask=start + cols < n, other=float("-inf"))
+            total += tl.sum(libdevice.pow(tl.maximum(x * am1 - tau_m, 0.0), inv), 0)
+        tau_lo = tl.where((total - 1.0) * f_lo >= 0, tau_m, tau_lo)
+    out = out_ptr + row.to(tl.int64) * n
+    for start in range(0, n, BLOCK):
+        mask = start + cols < n
+        x = tl.load(base + start + cols, mask=mask, other=float("-inf"))
+        p = libdevice.pow(tl.maximum(x * am1 - tau_m, 0.0), inv)
+        tl.store(out + start + cols, p / total, mask=mask)
+
+
+def entmax_fused(x: torch.Tensor, alpha: torch.Tensor) -> torch.Tensor:
+    """entmax_bisect of a (heads, rows, keys) fp32 tensor in one kernel launch;
+    alpha is (heads, 1, 1). The 40 bisection steps otherwise cost some 280
+    tiny kernels that the CPU launches one by one while the GPU waits."""
+    heads, rows, keys = x.shape
+    x = x.contiguous()
+    out = torch.empty_like(x)
+    block = min(triton.next_power_of_2(keys), 2048)
+    _entmax_bisect_kernel[(heads * rows,)](
+        x, alpha.reshape(heads).contiguous(), out, rows, keys, 1.0 / keys,
+        N_ITER=ENTMAX_ITERS, BLOCK=block, num_warps=4 if block <= 1024 else 8,
+    )
+    return out
 
 
 class LayoutQuestion(msgspec.Struct, frozen=True):
@@ -326,6 +388,13 @@ class JointSchemaHead(nn.Module):
 
         num_questions = len(type_ids)
         widest = max(len(q.option_spans) for questions in layouts for q in questions)
+        # Memory size of each option's and each question's request, for SSMax.
+        option_memory_list = [
+            lengths[request]
+            for request, count in enumerate(option_counts)
+            for _ in range(count)
+        ]
+        question_memory_list = [lengths[request] for request in question_request]
         sizes = [
             2 * num_questions,
             len(option_bounds),
@@ -335,20 +404,29 @@ class JointSchemaHead(nn.Module):
             num_questions,
             batch,
             3 * (batch + 1),
+            len(option_memory_list),
+            num_questions,
         ]
-        packed = torch.tensor(
-            question_bounds
-            + option_bounds
-            + type_ids
-            + owner
-            + slot
-            + question_request
-            + last_tokens
-            + token_cu
-            + question_cu
-            + option_cu,
-            dtype=torch.long,
-        ).to(device, non_blocking=True)
+        # One pinned copy: a pageable one would wait for the queued GPU work.
+        packed = (
+            torch.tensor(
+                question_bounds
+                + option_bounds
+                + type_ids
+                + owner
+                + slot
+                + question_request
+                + last_tokens
+                + token_cu
+                + question_cu
+                + option_cu
+                + option_memory_list
+                + question_memory_list,
+                dtype=torch.long,
+            )
+            .pin_memory()
+            .to(device, non_blocking=True)
+        )
         (
             question_bounds_t,
             option_bounds_t,
@@ -358,15 +436,18 @@ class JointSchemaHead(nn.Module):
             question_request_t,
             last_tokens_t,
             cu_t,
+            option_memory,
+            question_memory,
         ) = torch.split(packed, sizes)
         question_bounds_t = question_bounds_t.view(-1, 2)
         option_bounds_t = option_bounds_t.view(-1, 2)
         token_cu_t, question_cu_t, option_cu_t = (
             cu_t.to(torch.int32).view(3, batch + 1).unbind(0)
         )
-        token_bounds = (token_cu_t, max(lengths))
-        question_bounds_cu = (question_cu_t, max(len(q) for q in layouts))
-        option_bounds_cu = (option_cu_t, max(option_counts))
+        # (device cu, longest, host cu): dense attention slices with the host copy.
+        token_bounds = (token_cu_t, max(lengths), token_cu)
+        question_bounds_cu = (question_cu_t, max(len(q) for q in layouts), question_cu)
+        option_bounds_cu = (option_cu_t, max(option_counts), option_cu)
 
         normalized = self.hidden_norm(hidden)
         # Running sums over each schema region, after one zero row per request.
@@ -407,14 +488,6 @@ class JointSchemaHead(nn.Module):
             )
         else:
             memory = self.memory_projection(normalized)
-        # Memory size per request, for SSMax.
-        memory_lengths = torch.tensor(lengths, dtype=torch.long).to(device, non_blocking=True)
-        option_memory = memory_lengths.repeat_interleave(
-            torch.tensor(option_counts).to(device, non_blocking=True)
-        )
-        question_memory = memory_lengths.repeat_interleave(
-            torch.tensor([len(q) for q in layouts]).to(device, non_blocking=True)
-        )
         global_vectors = normalized[last_tokens_t]
         question_vectors = span_means(hidden_prefix, question_bounds_t)
         option_contexts = span_means(hidden_prefix, option_bounds_t)
@@ -512,8 +585,8 @@ def _attention(
     module: nn.MultiheadAttention,
     queries: torch.Tensor,
     keys: Optional[torch.Tensor],
-    query_bounds: Tuple[torch.Tensor, int],
-    key_bounds: Tuple[torch.Tensor, int],
+    query_bounds: Tuple[torch.Tensor, int, List[int]],
+    key_bounds: Tuple[torch.Tensor, int, List[int]],
     query_memory: Optional[torch.Tensor] = None,
     entmax_softmax: bool = False,
 ) -> torch.Tensor:
@@ -542,7 +615,7 @@ def _attention(
         entmax = None
     if query.device.type != "cuda" or entmax is not None:
         output = _dense_attention(
-            query, key, value, heads, query_bounds[0], key_bounds[0], ssmax, entmax
+            query, key, value, heads, query_bounds[2], key_bounds[2], ssmax, entmax
         )
         return module.out_proj(output)
     if ssmax is not None:
@@ -569,18 +642,19 @@ def _dense_attention(
     key: torch.Tensor,
     value: torch.Tensor,
     heads: int,
-    query_cu: torch.Tensor,
-    key_cu: torch.Tensor,
+    query_cu: List[int],
+    key_cu: List[int],
     ssmax: Optional[torch.Tensor],
     entmax: Optional[torch.Tensor],
 ) -> torch.Tensor:
     """Attention per request with explicit logits, as GreenLeaf's training head
-    computes it (SSMax on the logits, entmax or softmax)."""
+    computes it (SSMax on the logits, entmax or softmax). The bounds are host
+    lists, so the loop never waits for the GPU."""
     head_dim = query.shape[-1] // heads
     alpha = None
     if entmax is not None:
         alpha = (1.0 + entmax.exp().clamp(max=1.0)).float().view(heads, 1, 1)
-    query_cu, key_cu = query_cu.tolist(), key_cu.tolist()
+    impl = _ENTMAX_IMPL if query.device.type == "cuda" else "eager"
     output = query.new_empty(query.shape[0], heads * head_dim)
     for r in range(len(query_cu) - 1):
         q0, q1, k0, k1 = query_cu[r], query_cu[r + 1], key_cu[r], key_cu[r + 1]
@@ -591,10 +665,13 @@ def _dense_attention(
         v = value[k0:k1].view(-1, heads, head_dim).transpose(0, 1)
         s = q @ k.transpose(-1, -2) / math.sqrt(head_dim)
         if ssmax is not None:
-            n = torch.tensor(k1 - k0, device=s.device).to(s.dtype)
-            s = s * (n / SSMAX_REF_LEN) ** ssmax.view(heads, 1, 1)
+            # n / ref in the logits' dtype, as GreenLeaf computes it, on the host.
+            ratio = float(torch.tensor(k1 - k0).to(s.dtype)) / SSMAX_REF_LEN
+            s = s * ratio ** ssmax.view(heads, 1, 1)
         if alpha is None:
             p = s.softmax(-1)
+        elif impl == "triton":
+            p = entmax_fused(s.float(), alpha).to(v.dtype)
         else:
             p = entmax_bisect(s.float(), alpha).to(v.dtype)
         output[q0:q1] = (p @ v).transpose(0, 1).reshape(q1 - q0, -1).to(output.dtype)
