@@ -28,7 +28,13 @@ _SYSTEM_PROMPT = (
     "Read the complete state and schema. Decide every field jointly. Each answer "
     "must be exactly one of that field's allowed options."
 )
-_PREFIX = f"<|im_start|>system\n{_SYSTEM_PROMPT}<|im_end|>\n<|im_start|>user\nSTATE:\n"
+_SYSTEM = f"<|im_start|>system\n{_SYSTEM_PROMPT}<|im_end|>\n<|im_start|>user\n"
+_PREFIX = f"{_SYSTEM}STATE:\n"
+# GreenLeaf "sandwich": the fields come once before the state and again after
+# it; the head reads the spans of the second copy, which has seen the state.
+_SANDWICH_PREFIX = f"{_SYSTEM}SCHEMA FIELDS:\n"
+_SANDWICH_STATE = "\nSTATE:\n"
+LAYOUTS = ("state_first", "sandwich")
 _IMAGE = "<|vision_start|><|image_pad|><|vision_end|>"
 _SUFFIX = (
     "\n<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
@@ -66,6 +72,7 @@ def encode_joint_schema(
     request: SystemOneRequest,
     max_length: int,
     image_token_counts: Sequence[int],
+    layout: str = "state_first",
 ) -> Tuple[List[int], List[int]]:
     """The prompt ids and their decision layout.
 
@@ -77,7 +84,12 @@ def encode_joint_schema(
     def tokens(text: str) -> List[int]:
         return tokenizer.encode(text, add_special_tokens=False)
 
-    schema = tokens("\n\nSCHEMA FIELDS:\n")
+    if layout not in LAYOUTS:
+        raise ValueError(f"unknown joint schema layout {layout!r}")
+    if layout == "sandwich" and request.images:
+        raise ValueError("a sandwich-layout checkpoint takes no images")
+    header = tokens("\n\nSCHEMA FIELDS:\n")
+    schema = []
     questions = []
     for index, (question_id, question) in enumerate(request.questions.items()):
         schema += tokens(
@@ -108,21 +120,31 @@ def encode_joint_schema(
             (QUESTION_TYPES.index(question.type), question_span, option_spans)
         )
 
-    prefix = tokens(_PREFIX)
+    if layout == "sandwich":
+        prefix = tokens(_SANDWICH_PREFIX) + schema + tokens(_SANDWICH_STATE)
+    else:
+        prefix = tokens(_PREFIX)
     if request.images:
         prefix += tokens(_IMAGE * len(request.images) + "\n")
     suffix = tokens(_SUFFIX)
     # Each image's single <|image_pad|> becomes that image's tokens.
     expansion = sum(count - 1 for count in image_token_counts)
-    fixed_length = len(prefix) + expansion + len(schema) + len(suffix)
+    fixed_length = len(prefix) + expansion + len(header) + len(schema) + len(suffix)
     if fixed_length > max_length:
         raise ValueError(
             f"the questions need {fixed_length} prompt tokens before the state, "
             f"but the prompt holds at most {max_length}"
         )
-    state = tokens(_render(request.state))[: max_length - fixed_length]
-    offset = len(prefix) + len(state)
-    input_ids = prefix + state + schema + suffix
+    state = tokens(_render(request.state))
+    budget = max_length - fixed_length
+    if layout == "sandwich" and len(state) > budget:
+        # A guard must read the newest message, at the end of the state:
+        # keep the last tokens.
+        state = state[len(state) - budget :]
+    else:
+        state = state[:budget]
+    offset = len(prefix) + len(state) + len(header)
+    input_ids = prefix + state + header + schema + suffix
     layout = pack_decision_layout(
         len(input_ids),
         [

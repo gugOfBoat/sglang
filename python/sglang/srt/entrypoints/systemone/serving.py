@@ -234,6 +234,9 @@ class SystemOneServing(OpenAIServingDecisions):
             request,
             max_length=max_length,
             image_token_counts=image_token_counts,
+            layout=(self.joint_head_config.get("greenleaf") or {}).get(
+                "layout", "state_first"
+            ),
         )
         adapted_request.input_ids = input_ids
         adapted_request.decision_layout = layout

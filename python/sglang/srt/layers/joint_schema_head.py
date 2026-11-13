@@ -32,6 +32,36 @@ QUESTION_TYPES = ("noul", "choice", "score")
 _MAX_GROUP_TOKENS = 65536
 _MAX_GROUP_SLOTS = 1 << 18
 
+# GreenLeaf-Decision extensions (memory mix, SSMax length scaling, α-entmax),
+# as in GreenLeaf's training head.
+SSMAX_REF_LEN = 1024
+ENTMAX_ITERS = 40
+
+
+def entmax_bisect(x: torch.Tensor, alpha: torch.Tensor, n_iter: int = ENTMAX_ITERS) -> torch.Tensor:
+    """α-entmax over the last dim by bisection on τ (forward of GreenLeaf's
+    ``_EntmaxBisect``). x may hold -inf; alpha broadcasts to x[..., :1]."""
+    am1 = alpha.expand(*x.shape[:-1], 1) - 1
+    z = x * am1
+    max_val = z.max(-1, keepdim=True).values
+    tau_lo = max_val - 1.0
+    tau_hi = max_val - (1.0 / x.shape[-1]) ** am1
+    inv = 1.0 / am1
+
+    def p_of(tau: torch.Tensor) -> torch.Tensor:
+        return torch.clamp(z - tau, min=0) ** inv
+
+    f_lo = p_of(tau_lo).sum(-1, keepdim=True) - 1
+    dm = tau_hi - tau_lo
+    p = p_of(tau_lo)
+    for _ in range(n_iter):
+        dm = dm / 2
+        tau_m = tau_lo + dm
+        p = p_of(tau_m)
+        f_m = p.sum(-1, keepdim=True) - 1
+        tau_lo = torch.where(f_m * f_lo >= 0, tau_m, tau_lo)
+    return p / p.sum(-1, keepdim=True)
+
 
 class LayoutQuestion(msgspec.Struct, frozen=True):
     question_type: int
@@ -153,8 +183,16 @@ class JointSchemaHead(nn.Module):
         layers: int,
         heads: int,
         feedforward: int,
+        n_mix: int = 0,
+        entmax: bool = False,
+        entmax_alpha_init: float = 1.01,
+        ssmax: bool = False,
+        entmax_softmax: bool = False,
     ) -> None:
         super().__init__()
+        # GreenLeaf runs its head with FP32 parameters under BF16 autocast.
+        self.greenleaf = bool(n_mix or entmax or ssmax)
+        self.entmax_softmax = entmax_softmax
         self.hidden_norm = nn.LayerNorm(hidden_size)
         self.memory_projection = nn.Linear(hidden_size, width, bias=False)
         self.question_projection = nn.Linear(hidden_size, width, bias=False)
@@ -188,6 +226,19 @@ class JointSchemaHead(nn.Module):
         self.prior_logit_scale = nn.Parameter(torch.zeros(()))
         self.joint_logit_scale = nn.Parameter(torch.zeros(()))
         self.residual_gate = nn.Parameter(torch.zeros(()))
+        # Memory cross-attentions (evidence routing, decoder multihead_attn) get
+        # per-head entmax / SSMax parameters, named as in the checkpoint.
+        for module in [l.attention for l in self.evidence_layers] + [
+            l.multihead_attn for l in self.layers
+        ]:
+            if entmax:
+                module.register_parameter(
+                    "entmax_log_alpha_m1",
+                    nn.Parameter(torch.full((heads,), math.log(entmax_alpha_init - 1.0))),
+                )
+            if ssmax:
+                module.register_parameter("ssmax_beta", nn.Parameter(torch.zeros(heads)))
+        self.memory_mix = nn.Parameter(torch.zeros(n_mix)) if n_mix else None
 
     @torch.no_grad()
     def forward_batch(
@@ -197,24 +248,30 @@ class JointSchemaHead(nn.Module):
         lengths: List[int],
         layouts: List[List[LayoutQuestion]],
         output_embedding_weight: torch.Tensor,
+        mids: Optional[List[torch.Tensor]] = None,
     ) -> List[torch.Tensor]:
         """One FP32 logit vector per request, its questions' options in layout order.
 
-        ``hidden`` holds the final hidden states of the requests back to back.
+        ``hidden`` holds the final hidden states of the requests back to back;
+        ``mids`` the final-norm outputs of the mixed layers, same rows.
         """
+        if self.memory_mix is not None and (mids is None or len(mids) != len(self.memory_mix)):
+            raise ValueError("memory mix needs the captured layer outputs")
         outputs: List[torch.Tensor] = []
         start = 0
-        for group in _groups(lengths, layouts):
-            group_lengths = [lengths[i] for i in group]
-            end = start + sum(group_lengths)
-            outputs += self._forward_group(
-                hidden[start:end],
-                input_ids[start:end],
-                group_lengths,
-                [layouts[i] for i in group],
-                output_embedding_weight,
-            )
-            start = end
+        with torch.autocast(hidden.device.type, dtype=torch.bfloat16, enabled=self.greenleaf):
+            for group in _groups(lengths, layouts):
+                group_lengths = [lengths[i] for i in group]
+                end = start + sum(group_lengths)
+                outputs += self._forward_group(
+                    hidden[start:end],
+                    input_ids[start:end],
+                    group_lengths,
+                    [layouts[i] for i in group],
+                    output_embedding_weight,
+                    None if mids is None else [m[start:end] for m in mids],
+                )
+                start = end
         return outputs
 
     def _forward_group(
@@ -224,7 +281,10 @@ class JointSchemaHead(nn.Module):
         lengths: List[int],
         layouts: List[List[LayoutQuestion]],
         output_embedding_weight: torch.Tensor,
+        mids: Optional[List[torch.Tensor]] = None,
     ) -> List[torch.Tensor]:
+        if self.greenleaf:
+            hidden = hidden.float()
         device, dtype = hidden.device, hidden.dtype
         batch = len(layouts)
         question_bounds, option_bounds = [], []
@@ -337,7 +397,24 @@ class JointSchemaHead(nn.Module):
             sums = prefix[bounds[:, 1]] - prefix[bounds[:, 0]]
             return (sums / (bounds[:, 1] - bounds[:, 0]).unsqueeze(-1)).to(dtype)
 
-        memory = self.memory_projection(normalized)
+        if self.memory_mix is not None:
+            # Only the memory reads the mix: h_last + Σ a_i (h_i − h_last).
+            mixed = sum(a.to(m.dtype) * m for a, m in zip(self.memory_mix, mids))
+            memory = self.memory_projection(
+                self.hidden_norm(
+                    (hidden * (1 - self.memory_mix.sum()) + mixed.float()).to(dtype)
+                )
+            )
+        else:
+            memory = self.memory_projection(normalized)
+        # Memory size per request, for SSMax.
+        memory_lengths = torch.tensor(lengths, dtype=torch.long).to(device, non_blocking=True)
+        option_memory = memory_lengths.repeat_interleave(
+            torch.tensor(option_counts).to(device, non_blocking=True)
+        )
+        question_memory = memory_lengths.repeat_interleave(
+            torch.tensor([len(q) for q in layouts]).to(device, non_blocking=True)
+        )
         global_vectors = normalized[last_tokens_t]
         question_vectors = span_means(hidden_prefix, question_bounds_t)
         option_contexts = span_means(hidden_prefix, option_bounds_t)
@@ -355,13 +432,18 @@ class JointSchemaHead(nn.Module):
                 layer.memory_norm(memory),
                 option_bounds_cu,
                 token_bounds,
+                option_memory,
+                self.entmax_softmax,
             )
             routed = routed + layer.feedforward(layer.feedforward_norm(routed))
 
         base_fields = self.question_projection(question_vectors)
-        scores = torch.matmul(
-            routed.unsqueeze(1), base_fields[owner_t].unsqueeze(2)
-        ).view(-1) / math.sqrt(routed.shape[-1])
+        if self.greenleaf:
+            scores = (routed * base_fields[owner_t]).sum(-1) / math.sqrt(routed.shape[-1])
+        else:
+            scores = torch.matmul(
+                routed.unsqueeze(1), base_fields[owner_t].unsqueeze(2)
+            ).view(-1) / math.sqrt(routed.shape[-1])
         padded_scores = torch.full(
             (num_questions, widest), float("-inf"), dtype=torch.float32, device=device
         )
@@ -369,7 +451,10 @@ class JointSchemaHead(nn.Module):
         weights = torch.softmax(padded_scores, dim=1).to(dtype)
         padded_options = routed.new_zeros(num_questions, widest, routed.shape[-1])
         padded_options[owner_t, slot_t] = routed
-        summaries = torch.sum(weights.unsqueeze(-1) * padded_options, dim=1)
+        weighted = weights.unsqueeze(-1) * padded_options
+        if self.greenleaf:
+            weighted = weighted.to(routed.dtype)
+        summaries = torch.sum(weighted, dim=1)
         fields = (
             base_fields
             + self.option_summary_norm(summaries)
@@ -390,6 +475,8 @@ class JointSchemaHead(nn.Module):
                 memory,
                 question_bounds_cu,
                 token_bounds,
+                question_memory,
+                self.entmax_softmax,
             )
             fields = fields + layer.linear2(
                 layer.activation(layer.linear1(layer.norm3(fields)))
@@ -401,9 +488,12 @@ class JointSchemaHead(nn.Module):
         anchor = F.normalize(
             question_vectors + global_vectors[question_request_t], dim=-1
         )
-        prior = prior_scale * torch.matmul(
-            F.normalize(lexical, dim=-1).unsqueeze(1), anchor[owner_t].unsqueeze(2)
-        ).view(-1)
+        if self.greenleaf:
+            prior = prior_scale * (F.normalize(lexical, dim=-1) * anchor[owner_t]).sum(-1)
+        else:
+            prior = prior_scale * torch.matmul(
+                F.normalize(lexical, dim=-1).unsqueeze(1), anchor[owner_t].unsqueeze(2)
+            ).view(-1)
         options = self.option_norm(routed)
         repeated = fields[owner_t]
         cosine = F.cosine_similarity(repeated, options, dim=-1)
@@ -424,9 +514,16 @@ def _attention(
     keys: Optional[torch.Tensor],
     query_bounds: Tuple[torch.Tensor, int],
     key_bounds: Tuple[torch.Tensor, int],
+    query_memory: Optional[torch.Tensor] = None,
+    entmax_softmax: bool = False,
 ) -> torch.Tensor:
     """nn.MultiheadAttention over packed sequences, keys and values from ``keys``
-    (or from ``queries`` when None), attending within each request."""
+    (or from ``queries`` when None), attending within each request.
+
+    ``query_memory`` (memory size of each query's request) turns on the
+    module's GreenLeaf SSMax / entmax parameters, if it has them. Exact entmax
+    runs per request without flash attention; ``entmax_softmax`` replaces it
+    by softmax (α ≈ 1)."""
     width = queries.shape[-1]
     heads = module.num_heads
     if keys is None:
@@ -439,6 +536,19 @@ def _attention(
         query = F.linear(queries, query_weight, query_bias)
         key, value = F.linear(keys, key_value_weight, key_value_bias).chunk(2, dim=-1)
     head_dim = width // heads
+    ssmax = getattr(module, "ssmax_beta", None) if query_memory is not None else None
+    entmax = getattr(module, "entmax_log_alpha_m1", None) if query_memory is not None else None
+    if entmax_softmax:
+        entmax = None
+    if query.device.type != "cuda" or entmax is not None:
+        output = _dense_attention(
+            query, key, value, heads, query_bounds[0], key_bounds[0], ssmax, entmax
+        )
+        return module.out_proj(output)
+    if ssmax is not None:
+        # Scaling the query scales its attention logits: s · (n / ref)^β.
+        factor = (query_memory.to(query.dtype) / SSMAX_REF_LEN)[:, None] ** ssmax[None, :]
+        query = (query.view(-1, heads, head_dim) * factor[..., None]).to(key.dtype)
     output = torch.ops.aten._flash_attention_forward(
         query.reshape(-1, heads, head_dim),
         key.reshape(-1, heads, head_dim),
@@ -452,6 +562,43 @@ def _attention(
         False,
     )[0]
     return module.out_proj(output.reshape(-1, width))
+
+
+def _dense_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    heads: int,
+    query_cu: torch.Tensor,
+    key_cu: torch.Tensor,
+    ssmax: Optional[torch.Tensor],
+    entmax: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """Attention per request with explicit logits, as GreenLeaf's training head
+    computes it (SSMax on the logits, entmax or softmax)."""
+    head_dim = query.shape[-1] // heads
+    alpha = None
+    if entmax is not None:
+        alpha = (1.0 + entmax.exp().clamp(max=1.0)).float().view(heads, 1, 1)
+    query_cu, key_cu = query_cu.tolist(), key_cu.tolist()
+    output = query.new_empty(query.shape[0], heads * head_dim)
+    for r in range(len(query_cu) - 1):
+        q0, q1, k0, k1 = query_cu[r], query_cu[r + 1], key_cu[r], key_cu[r + 1]
+        if q1 == q0:
+            continue
+        q = query[q0:q1].view(-1, heads, head_dim).transpose(0, 1)
+        k = key[k0:k1].view(-1, heads, head_dim).transpose(0, 1)
+        v = value[k0:k1].view(-1, heads, head_dim).transpose(0, 1)
+        s = q @ k.transpose(-1, -2) / math.sqrt(head_dim)
+        if ssmax is not None:
+            n = torch.tensor(k1 - k0, device=s.device).to(s.dtype)
+            s = s * (n / SSMAX_REF_LEN) ** ssmax.view(heads, 1, 1)
+        if alpha is None:
+            p = s.softmax(-1)
+        else:
+            p = entmax_bisect(s.float(), alpha).to(v.dtype)
+        output[q0:q1] = (p @ v).transpose(0, 1).reshape(q1 - q0, -1).to(output.dtype)
+    return output
 
 
 def _groups(lengths: List[int], layouts: List[List[LayoutQuestion]]) -> List[range]:
@@ -476,16 +623,24 @@ class JointSchemaPooler(nn.Module):
     """Pooler of a Clef checkpoint: the joint schema head's option logits per request."""
 
     def __init__(
-        self, head: JointSchemaHead, output_embedding: Callable[[], torch.Tensor]
+        self,
+        head: JointSchemaHead,
+        output_embedding: Callable[[], torch.Tensor],
+        final_norm: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
     ) -> None:
         super().__init__()
         self.head = head
-        # A callable, so the LM head is not registered twice as a parameter.
+        # Callables, so the LM head and final norm are not registered twice.
         self._output_embedding = output_embedding
+        self._final_norm = final_norm
 
     def forward(
-        self, hidden_states: torch.Tensor, forward_batch
+        self, hidden_states: torch.Tensor, forward_batch, aux_hidden_states=None
     ) -> EmbeddingPoolerOutput:
+        # Memory mix: the captured layer outputs, final norm applied.
+        mids = None
+        if self.head.memory_mix is not None:
+            mids = [self._final_norm(h) for h in aux_hidden_states]
         if (
             forward_batch.decision_layouts is None
             or forward_batch.extend_seq_lens_cpu is None
@@ -533,6 +688,7 @@ class JointSchemaPooler(nn.Module):
                 [lengths[i] for i in run],
                 [layouts[i] for i in run],
                 self._output_embedding(),
+                None if mids is None else [m[start:end] for m in mids],
             )
             for i, values in zip(run, logits):
                 embeddings[i] = values

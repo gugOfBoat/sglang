@@ -1672,6 +1672,10 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                     forward_batch,
                     aux_hidden_states,
                 )
+            elif aux_hidden_states is not None:
+                return self.pooler(
+                    hidden_states, forward_batch, aux_hidden_states=aux_hidden_states
+                )
             else:
                 return self.pooler(hidden_states, forward_batch)
         else:

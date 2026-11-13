@@ -15,6 +15,7 @@
 """Inference-only Qwen3.5 model and Qwen3.5 MoE model compatible with HuggingFace weights."""
 
 import logging
+import math
 import os
 from functools import lru_cache
 from typing import Iterable, Optional, Set, Tuple, Union
@@ -2403,8 +2404,29 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
             if joint_head_config is not None:
                 # A Clef checkpoint, whose joint schema head scores every option
                 # of every question from the final hidden states and LM head rows.
+                dims = {k: v for k, v in joint_head_config.items() if k != "greenleaf"}
+                greenleaf = joint_head_config.get("greenleaf") or {}
+                num_layers = config.text_config.num_hidden_layers
+                n_mix = 0
+                if greenleaf.get("memory_layers_from") is not None:
+                    # GreenLeaf memory mix: the outputs of layers first … n-2
+                    # (0-based), i.e. the inputs of layers first+1 … n-1.
+                    first = math.ceil(greenleaf["memory_layers_from"] * num_layers) - 1
+                    n_mix = num_layers - 1 - first
+                    self.capture_aux_hidden_states = True
+                    self.model.set_eagle3_layers_to_capture(
+                        list(range(first + 1, num_layers))
+                    )
+                head = JointSchemaHead(
+                    **dims,
+                    n_mix=n_mix,
+                    entmax=greenleaf.get("entmax", False),
+                    entmax_alpha_init=greenleaf.get("entmax_alpha_init", 1.01),
+                    ssmax=greenleaf.get("ssmax", False),
+                    entmax_softmax=os.environ.get("GREENLEAF_ENTMAX_SOFTMAX") == "1",
+                )
                 self.pooler = JointSchemaPooler(
-                    JointSchemaHead(**joint_head_config), lambda: self.lm_head.weight
+                    head, lambda: self.lm_head.weight, self.model.norm
                 )
 
     def get_hidden_dim(self, module_name: str, layer_idx: int):
@@ -2562,6 +2584,9 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 model.model_path, "joint_head.safetensors", revision=model.revision
             )
         )
+        if self.pooler.head.greenleaf:
+            # FP32 parameters, as GreenLeaf trains and saves its head.
+            self.pooler.head.float()
         self.pooler.head.load_state_dict(state_dict, strict=True)
 
     def _load_decision_readout(self) -> None:
