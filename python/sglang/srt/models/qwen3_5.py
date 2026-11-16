@@ -2425,8 +2425,18 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
                     ssmax=greenleaf.get("ssmax", False),
                     entmax_softmax=os.environ.get("GREENLEAF_ENTMAX_SOFTMAX") == "1",
                 )
+                # Under tensor parallelism the LM head holds a slice of the
+                # vocabulary, while the head reads the rows of any token: keep
+                # a full copy of the rows for the head (load_weights).
+                self._joint_head_rows = None
                 self.pooler = JointSchemaPooler(
-                    head, lambda: self.lm_head.weight, self.model.norm
+                    head,
+                    lambda: (
+                        self.lm_head.weight
+                        if self._joint_head_rows is None
+                        else self._joint_head_rows
+                    ),
+                    self.model.norm,
                 )
 
     def get_hidden_dim(self, module_name: str, layer_idx: int):
@@ -2555,6 +2565,14 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
+                if (
+                    name == "lm_head.weight"
+                    and isinstance(self.pooler, JointSchemaPooler)
+                    and param.shape[0] < loaded_weight.shape[0]
+                ):
+                    self._joint_head_rows = loaded_weight.to(
+                        device=param.device, dtype=param.dtype
+                    )
                 if (
                     self.config.tie_word_embeddings
                     and name == "model.embed_tokens.weight"

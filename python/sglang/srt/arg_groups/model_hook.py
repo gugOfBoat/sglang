@@ -987,18 +987,19 @@ def handle_model_capability_adjustments(server_args: Any):
     # also puts the FA backend on its raw K/V path, which skips the KV pool. A
     # Kev checkpoint's pointer head reads two positions of each question's
     # prompt and is served the same way.
+    # A Clef checkpoint may use tensor parallelism: its model keeps a full copy
+    # of the LM head rows for the head (see Qwen3_5ForConditionalGeneration).
     if model_config.joint_head_config is not None:
-        name, head = "Clef", "joint schema head"
-        tp_reason = ", since the joint schema head reads full LM head rows"
+        name, head, tp_ok = "Clef", "joint schema head", True
     elif model_config.pointer_head is not None:
-        name, head, tp_reason = "Kev", "pointer head", ""
+        name, head, tp_ok = "Kev", "pointer head", False
     else:
         name = None
     if name is not None:
-        if cfg.tp_size != 1 or cfg.pp_size != 1:
+        if (cfg.tp_size != 1 and not tp_ok) or cfg.pp_size != 1:
             raise ValueError(
-                f"{name} checkpoints are served with --tp-size 1 and --pp-size 1"
-                f"{tp_reason}"
+                f"{name} checkpoints are served with "
+                f"{'' if tp_ok else '--tp-size 1 and '}--pp-size 1"
             )
         for key, value in (
             ("is_embedding", True),
