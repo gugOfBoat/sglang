@@ -1868,6 +1868,9 @@ class Envs:
     SGLANG_HIP_MHC_BOUNDARY_WIDE_TILE = EnvBool(True)
 
     # cache, GEMM, and distributed
+    # GreenLeaf decision checkpoints (/v1/systemone): capture prefill CUDA graphs (breakable) instead of
+    # forcing eager prefill. The joint schema head runs eagerly after the captured body.
+    SGLANG_GL_PREFILL_CUDA_GRAPH = EnvBool(False)
     SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(True)
     # ROCm gfx950: fuse inverse-RoPE into the wo_a mxfp8 quant (aiter
     # inverse_rope_group_quant) instead of a separate fused_rope_inplace + Triton

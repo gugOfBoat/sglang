@@ -1008,7 +1008,11 @@ def handle_model_capability_adjustments(server_args: Any):
             declare_resolution(
                 server_args, "_handle_model_capability_adjustments", **{key: value}
             )
-        for phase in (Phase.DECODE, Phase.PREFILL):
+        # Decision checkpoints never decode. Prefill graphs stay off unless
+        # SGLANG_GL_PREFILL_CUDA_GRAPH=1: the breakable runner captures the
+        # transformer body and replays the joint schema head eagerly.
+        phases = (Phase.DECODE,) if envs.SGLANG_GL_PREFILL_CUDA_GRAPH.get() else (Phase.DECODE, Phase.PREFILL)
+        for phase in phases:
             declare_resolution(
                 server_args,
                 "_handle_model_capability_adjustments",
@@ -1018,7 +1022,8 @@ def handle_model_capability_adjustments(server_args: Any):
             )
         logger.info(
             f"{name} {head} detected: serving /v1/systemone decisions in "
-            "embedding mode without radix cache, chunked prefill, or CUDA graphs."
+            "embedding mode without radix cache or chunked prefill; prefill CUDA graphs "
+            f"{'on' if envs.SGLANG_GL_PREFILL_CUDA_GRAPH.get() else 'off'}."
         )
 
     if (

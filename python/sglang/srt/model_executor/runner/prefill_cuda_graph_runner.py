@@ -2230,6 +2230,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             # MTP consumes the target model's live multimodal embeddings in its
             # eager wrapper before the captured transformer body is replayed.
             tail_batch.mm_input_embeds = forward_batch.mm_input_embeds
+            # The GreenLeaf joint schema head reads the question layout of the live request.
+            tail_batch.decision_layouts = forward_batch.decision_layouts
         model_kwargs = kwargs
         if self._use_draft_input_embeds:
             # Draft forwards that accept `input_embeds` (all current EAGLE
